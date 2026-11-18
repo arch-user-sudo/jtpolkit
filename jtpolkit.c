@@ -48,6 +48,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -396,6 +397,64 @@ typedef struct App App;
 static Auth g_auth;
 static App *g_app;
 static volatile sig_atomic_t g_signal_quit;
+
+/* ---- daemon <-> gui IPC ------------------------------------------- */
+/* The daemon owns the polkit registration and never touches Wayland.
+ * It forks a short-lived GUI process when a prompt is needed.  Closing
+ * the GUI window kills only that child; the daemon stays registered. */
+
+static int g_is_gui;                 /* set in the forked GUI process */
+static int g_ipc = -1;               /* socketpair end used by this process */
+static pid_t g_gui_pid = -1;         /* daemon: current GUI child */
+
+enum {
+    IPC_INIT,       /* daemon -> gui: initial state struct */
+    IPC_REQUEST,    /* daemon -> gui: request/prompt */
+    IPC_INFO,       /* daemon -> gui: info text */
+    IPC_ERROR,      /* daemon -> gui: error text */
+    IPC_DONE,       /* daemon -> gui: auth finished */
+    IPC_ACCENT,     /* daemon -> gui: new accent */
+    IPC_QUIT,       /* daemon -> gui: exit */
+    IPC_PASSWORD,   /* gui -> daemon: password response */
+    IPC_CANCEL,     /* gui -> daemon: user cancelled */
+    IPC_CLOSE       /* gui -> daemon: window closed */
+};
+
+typedef struct {
+    int type;
+    char payload[512];
+} IpcMsg;
+
+static int ipc_send(int fd, int type, const char *payload)
+{
+    IpcMsg msg;
+    memset(&msg, 0, sizeof msg);
+    msg.type = type;
+    if (payload)
+        snprintf(msg.payload, sizeof msg.payload, "%s", payload);
+    return (int)write(fd, &msg, sizeof msg) == (int)sizeof msg;
+}
+
+/* Returns 1 on a message, 0 on EOF, -1 on error (errno set). */
+static int ipc_recv(int fd, IpcMsg *msg)
+{
+    char *p = (char *)msg;
+    size_t left = sizeof *msg;
+    while (left > 0) {
+        ssize_t n = read(fd, p, left);
+        if (n > 0) { p += n; left -= (size_t)n; continue; }
+        if (n == 0)
+            return left == sizeof *msg ? 0 : -1;
+        if (errno == EINTR)
+            continue;
+        return -1;
+    }
+    return 1;
+}
+
+static void gui_spawn(void);
+static void gui_stop(void);
+static int gui_main(void);
 
 static void app_show_window(void);
 static void app_hide_window(void);
@@ -746,7 +805,12 @@ static void session_request(PolkitAgentSession *session, gchar *request,
     g_auth.echo_on = !!echo_on;
     g_auth.awaiting = 1;
     g_auth.password[0] = '\0';
-    auth_mark_dirty();
+
+    gui_spawn();
+
+    char payload[sizeof g_auth.prompt + 16];
+    snprintf(payload, sizeof payload, "%d|%s", g_auth.echo_on, g_auth.prompt);
+    ipc_send(g_ipc, IPC_REQUEST, payload);
 }
 
 static void session_info(PolkitAgentSession *session, gchar *text,
@@ -755,7 +819,7 @@ static void session_info(PolkitAgentSession *session, gchar *text,
     (void)session;
     (void)user_data;
     g_snprintf(g_auth.info, sizeof g_auth.info, "%s", text ? text : "");
-    auth_mark_dirty();
+    ipc_send(g_ipc, IPC_INFO, g_auth.info);
 }
 
 static void session_error(PolkitAgentSession *session, gchar *text,
@@ -764,7 +828,7 @@ static void session_error(PolkitAgentSession *session, gchar *text,
     (void)session;
     (void)user_data;
     g_snprintf(g_auth.error, sizeof g_auth.error, "%s", text ? text : "");
-    auth_mark_dirty();
+    ipc_send(g_ipc, IPC_ERROR, g_auth.error);
 }
 
 static void session_completed(PolkitAgentSession *session,
@@ -778,11 +842,20 @@ static void session_completed(PolkitAgentSession *session,
 
 static void auth_submit(void)
 {
-    if (!g_auth.active || g_auth.complete || !g_auth.awaiting ||
-        !g_auth.session)
+    if (!g_auth.active || g_auth.complete || !g_auth.awaiting)
+        return;
+    if (!g_is_gui && !g_auth.session)
         return;
 
     g_auth.awaiting = 0;
+
+    if (g_is_gui) {
+        ipc_send(g_ipc, IPC_PASSWORD, g_auth.password);
+        memset(g_auth.password, 0, sizeof g_auth.password);
+        g_auth.info[0] = '\0';
+        auth_mark_dirty();
+        return;
+    }
 
     char *response = g_strdup(g_auth.password);
     polkit_agent_session_response(g_auth.session, response ? response : "");
@@ -799,6 +872,10 @@ static void auth_cancel(void)
 {
     if (!g_auth.active || g_auth.complete)
         return;
+    if (g_is_gui) {
+        ipc_send(g_ipc, IPC_CANCEL, "");
+        return;
+    }
     if (g_auth.session)
         polkit_agent_session_cancel(g_auth.session);
     else
@@ -862,6 +939,13 @@ static void auth_complete(gboolean ok, const char *message)
 
     memset(g_auth.password, 0, sizeof g_auth.password);
     auth_mark_dirty();
+
+    if (!g_is_gui) {
+        char payload[64];
+        snprintf(payload, sizeof payload, "%d|%s", ok,
+                 g_auth.error[0] ? g_auth.error : "");
+        ipc_send(g_ipc, IPC_DONE, payload);
+    }
 }
 
 static void on_cancelled(GCancellable *cancellable, gpointer user_data)
@@ -1347,8 +1431,10 @@ static void toplevel_close(void *data, struct xdg_toplevel *t)
 {
     (void)t;
     App *a = data;
+    /* Tell the daemon we were closed; it cancels the polkit request.
+     * Only this GUI process exits -- the daemon stays registered. */
+    ipc_send(g_ipc, IPC_CLOSE, "");
     a->quit = 1;
-    auth_cancel();
 }
 
 static const struct xdg_toplevel_listener toplevel_listener = {
@@ -1913,8 +1999,18 @@ static int wayland_start(App *a)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Live control socket                                                */
+/*  Control socket (daemon only)                                       */
 /* ------------------------------------------------------------------ */
+
+typedef struct {
+    int fd;
+    int client_fd;
+    char buf[256];
+    size_t len;
+    int quit;
+} Ctl;
+
+static Ctl g_ctl = { .fd = -1, .client_fd = -1 };
 
 static void ctl_path(char *buf, size_t n)
 {
@@ -1923,7 +2019,7 @@ static void ctl_path(char *buf, size_t n)
     snprintf(buf, n, "%s/jtpolkit-ctl.sock", rt);
 }
 
-static void ctl_handle_line(App *a, char *line)
+static void ctl_handle_line(char *line)
 {
     while (*line == ' ' || *line == '\t')
         line++;
@@ -1934,8 +2030,9 @@ static void ctl_handle_line(App *a, char *line)
         line[--n] = '\0';
 
     if (!strcmp(line, "quit")) {
-        a->quit = 1;
+        g_ctl.quit = 1;
         auth_cancel();
+        ipc_send(g_ipc, IPC_QUIT, "");
         return;
     }
 
@@ -1947,101 +2044,102 @@ static void ctl_handle_line(App *a, char *line)
         unsigned rgb;
         if (accent_parse(arg, &rgb)) {
             accent_set(rgb);
-            a->dirty = 1;
+            char hex[16];
+            snprintf(hex, sizeof hex, "#%06X", rgb);
+            ipc_send(g_ipc, IPC_ACCENT, hex);
         }
     }
 }
 
-static void ctl_close_client(App *a)
+static void ctl_close_client(void)
 {
-    if (a->ctl_client_fd >= 0) {
-        close(a->ctl_client_fd);
-        a->ctl_client_fd = -1;
+    if (g_ctl.client_fd >= 0) {
+        close(g_ctl.client_fd);
+        g_ctl.client_fd = -1;
     }
-    a->ctl_len = 0;
+    g_ctl.len = 0;
 }
 
-static void ctl_process(App *a, int flush)
+static void ctl_process(int flush)
 {
     size_t start = 0;
-    for (size_t i = 0; i < a->ctl_len; i++) {
-        if (a->ctl_buf[i] == '\n') {
-            a->ctl_buf[i] = '\0';
-            ctl_handle_line(a, a->ctl_buf + start);
+    for (size_t i = 0; i < g_ctl.len; i++) {
+        if (g_ctl.buf[i] == '\n') {
+            g_ctl.buf[i] = '\0';
+            ctl_handle_line(g_ctl.buf + start);
             start = i + 1;
         }
     }
     if (start > 0) {
-        memmove(a->ctl_buf, a->ctl_buf + start, a->ctl_len - start);
-        a->ctl_len -= start;
+        memmove(g_ctl.buf, g_ctl.buf + start, g_ctl.len - start);
+        g_ctl.len -= start;
     }
-    if (flush && a->ctl_len > 0) {
-        a->ctl_buf[a->ctl_len] = '\0';
-        ctl_handle_line(a, a->ctl_buf);
-        a->ctl_len = 0;
+    if (flush && g_ctl.len > 0) {
+        g_ctl.buf[g_ctl.len] = '\0';
+        ctl_handle_line(g_ctl.buf);
+        g_ctl.len = 0;
     }
 }
 
-static void ctl_read_client(App *a)
+static void ctl_read_client(void)
 {
     char buf[128];
     for (;;) {
-        ssize_t n = read(a->ctl_client_fd, buf, sizeof(buf));
+        ssize_t n = read(g_ctl.client_fd, buf, sizeof(buf));
         if (n > 0) {
-            size_t room = sizeof(a->ctl_buf) - 1 - a->ctl_len;
+            size_t room = sizeof(g_ctl.buf) - 1 - g_ctl.len;
             if ((size_t)n > room) {
-                ctl_close_client(a);
+                ctl_close_client();
                 return;
             }
-            memcpy(a->ctl_buf + a->ctl_len, buf, (size_t)n);
-            a->ctl_len += (size_t)n;
-            ctl_process(a, 0);
+            memcpy(g_ctl.buf + g_ctl.len, buf, (size_t)n);
+            g_ctl.len += (size_t)n;
+            ctl_process(0);
             continue;
         }
         if (n == 0) {
-            ctl_process(a, 1);
-            ctl_close_client(a);
+            ctl_process(1);
+            ctl_close_client();
             return;
         }
         if (errno == EINTR)
             continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            ctl_process(a, 1);
-            ctl_close_client(a);
+            ctl_process(1);
+            ctl_close_client();
             return;
         }
         return;
     }
 }
 
-static void ctl_accept(App *a)
+static void ctl_accept(void)
 {
     for (;;) {
-        int fd = accept4(a->ctl_fd, NULL, NULL,
+        int fd = accept4(g_ctl.fd, NULL, NULL,
                          SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) {
             if (errno == EINTR)
                 continue;
             break;
         }
-        if (a->ctl_client_fd >= 0) {
+        if (g_ctl.client_fd >= 0) {
             close(fd);
             continue;
         }
-        a->ctl_client_fd = fd;
-        a->ctl_len = 0;
+        g_ctl.client_fd = fd;
+        g_ctl.len = 0;
     }
 }
 
-static int ctl_start(App *a)
+static int ctl_start(void)
 {
     char path[256];
     ctl_path(path, sizeof(path));
 
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     if (strlen(path) >= sizeof(addr.sun_path)) {
-        fprintf(stderr, "jtpolkit: control socket path too long: %s\n",
-                path);
+        fprintf(stderr, "jtpolkit: control socket path too long: %s\n", path);
         return 0;
     }
     snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
@@ -2053,8 +2151,7 @@ static int ctl_start(App *a)
         return 0;
     }
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "jtpolkit: cannot bind %s: %s\n",
-                path, strerror(errno));
+        fprintf(stderr, "jtpolkit: cannot bind %s: %s\n", path, strerror(errno));
         close(fd);
         return 0;
     }
@@ -2066,96 +2163,90 @@ static int ctl_start(App *a)
         return 0;
     }
 
-    a->ctl_fd = fd;
+    g_ctl.fd = fd;
     return 1;
 }
 
-static void ctl_cleanup(App *a)
+static void ctl_cleanup(void)
 {
-    ctl_close_client(a);
-    if (a->ctl_fd >= 0) {
-        close(a->ctl_fd);
-        a->ctl_fd = -1;
+    ctl_close_client();
+    if (g_ctl.fd >= 0) {
+        close(g_ctl.fd);
+        g_ctl.fd = -1;
         char path[256];
         ctl_path(path, sizeof(path));
         unlink(path);
     }
 }
 
-/* Returns < 0 on a fatal display error, 0 otherwise. */
-static int pump_events(App *a, int timeout_ms)
+/* ------------------------------------------------------------------ */
+/*  Daemon <-> GUI process management                                  */
+/* ------------------------------------------------------------------ */
+
+static int g_ipc_done;   /* GUI: daemon sent IPC_DONE, exit after linger */
+
+static void gui_spawn(void)
 {
-    if (wl_display_dispatch_pending(a->display) < 0)
-        return -1;
-
-    int want_write = 0;
-    if (wl_display_flush(a->display) < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK)
-            return -1;
-        want_write = 1;
+    if (g_gui_pid > 0) {
+        int status;
+        pid_t r = waitpid(g_gui_pid, &status, WNOHANG);
+        if (r == 0)
+            return;                 /* still running */
+        g_gui_pid = -1;
+    }
+    if (g_ipc >= 0) {
+        close(g_ipc);
+        g_ipc = -1;
     }
 
-    struct pollfd pfd[3];
-    pfd[0].fd = wl_display_get_fd(a->display);
-    pfd[0].events = POLLIN | (want_write ? POLLOUT : 0);
-    pfd[0].revents = 0;
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) < 0)
+        return;
 
-    int nfds = 1;
-    int ctl_idx = -1;
-    int ctl_client_idx = -1;
-    if (a->ctl_fd >= 0) {
-        ctl_idx = nfds;
-        pfd[nfds].fd = a->ctl_fd;
-        pfd[nfds].events = POLLIN;
-        pfd[nfds].revents = 0;
-        nfds++;
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(sv[0]);
+        close(sv[1]);
+        return;
     }
-    if (a->ctl_client_fd >= 0) {
-        ctl_client_idx = nfds;
-        pfd[nfds].fd = a->ctl_client_fd;
-        pfd[nfds].events = POLLIN;
-        pfd[nfds].revents = 0;
-        nfds++;
+    if (pid == 0) {
+        /* Child: run the Wayland GUI.  g_auth is inherited with the
+         * request details already filled in. */
+        close(sv[0]);
+        g_ipc = sv[1];
+        g_is_gui = 1;
+        int rc = gui_main();
+        _exit(rc);
     }
-
-    int pr = poll(pfd, (nfds_t)nfds, timeout_ms);
-    if (pr < 0)
-        return (errno == EINTR) ? 0 : -1;
-    if (pr == 0)
-        return 0;
-
-    if (pfd[0].revents & POLLOUT) {
-        if (wl_display_flush(a->display) < 0 && errno != EAGAIN)
-            return -1;
-    }
-    if (pfd[0].revents & (POLLERR | POLLHUP | POLLNVAL))
-        return -1;
-    if (pfd[0].revents & POLLIN) {
-        if (wl_display_dispatch(a->display) < 0)
-            return -1;
-    }
-    if (ctl_idx >= 0 && (pfd[ctl_idx].revents & POLLIN))
-        ctl_accept(a);
-    if (ctl_client_idx >= 0 && pfd[ctl_client_idx].revents)
-        ctl_read_client(a);
-    return 0;
+    close(sv[1]);
+    g_ipc = sv[0];
+    g_gui_pid = pid;
 }
 
-static void on_signal(int sig)
+static void gui_stop(void)
 {
-    (void)sig;
-    g_signal_quit = 1;
+    if (g_ipc >= 0) {
+        ipc_send(g_ipc, IPC_QUIT, "");
+        close(g_ipc);
+        g_ipc = -1;
+    }
+    if (g_gui_pid > 0) {
+        kill(g_gui_pid, SIGTERM);
+        waitpid(g_gui_pid, NULL, 0);
+        g_gui_pid = -1;
+    }
 }
+
+/* ------------------------------------------------------------------ */
+/*  GUI process: Wayland event loop                                    */
+/* ------------------------------------------------------------------ */
 
 static void app_cleanup(App *a)
 {
-    ctl_cleanup(a);
-
     if (g_glow) {
         cairo_surface_destroy(g_glow);
         g_glow = NULL;
     }
-
     if (a->frame_cb) {
         wl_callback_destroy(a->frame_cb);
         a->frame_cb = NULL;
@@ -2225,35 +2316,124 @@ static void app_cleanup(App *a)
     }
 }
 
-/* ------------------------------------------------------------------ */
-/*  main                                                               */
-/* ------------------------------------------------------------------ */
-
-int main(int argc, char **argv)
+static void gui_handle_ipc(IpcMsg *msg, App *a)
 {
-    if (!accent_cli(&argc, argv))
-        return 2;
+    switch (msg->type) {
+    case IPC_REQUEST: {
+        int echo = 0;
+        const char *prompt = strchr(msg->payload, '|');
+        if (prompt) {
+            echo = atoi(msg->payload);
+            prompt++;
+        } else {
+            prompt = msg->payload;
+        }
+        snprintf(g_auth.prompt, sizeof g_auth.prompt, "%s", prompt);
+        g_auth.echo_on = !!echo;
+        g_auth.awaiting = 1;
+        g_auth.password[0] = '\0';
+        g_auth.error[0] = '\0';
+        g_auth.info[0] = '\0';
+        g_auth.active = 1;
+        g_auth.complete = 0;
+        app_show_window();
+        a->dirty = 1;
+        break;
+    }
+    case IPC_INFO:
+        snprintf(g_auth.info, sizeof g_auth.info, "%s", msg->payload);
+        g_auth.error[0] = '\0';
+        a->dirty = 1;
+        break;
+    case IPC_ERROR:
+        snprintf(g_auth.error, sizeof g_auth.error, "%s", msg->payload);
+        g_auth.info[0] = '\0';
+        a->dirty = 1;
+        break;
+    case IPC_DONE: {
+        int ok = atoi(msg->payload);
+        const char *err = strchr(msg->payload, '|');
+        g_auth.active = 0;
+        g_auth.awaiting = 0;
+        g_auth.complete = 1;
+        g_auth.ok = !!ok;
+        g_auth.hide_at = mono_sec() + (ok ? 0.7 : 1.2);
+        if (!ok && err && err[1])
+            snprintf(g_auth.error, sizeof g_auth.error, "%s", err + 1);
+        if (g_ipc_done == 0)
+            g_ipc_done = 1;
+        a->dirty = 1;
+        break;
+    }
+    case IPC_ACCENT: {
+        unsigned rgb;
+        if (accent_parse(msg->payload, &rgb)) {
+            accent_set(rgb);
+            a->dirty = 1;
+        }
+        break;
+    }
+    case IPC_QUIT:
+        a->quit = 1;
+        break;
+    default:
+        break;
+    }
+}
 
-    if (argc >= 2 && (!strcmp(argv[1], "-h") ||
-                      !strcmp(argv[1], "--help"))) {
-        printf("usage: %s [ACCENT]\n\n"
-               "  ACCENT              #RRGGBB or RRGGBB, for example '#378484'\n"
-               "  --accent COLOR      explicit form of ACCENT\n\n"
-               "the default accent is #E8A03C (amber)\n\n"
-               "registers a polkit authentication agent for this session;\n"
-               "Enter submits, Escape cancels\n"
-               "live accent: jtpolkitctl accent '#RRGGBB'\n"
-               "requires a Wayland compositor supporting xdg-shell\n",
-               argv[0]);
-        return 0;
+/* GUI pump: Wayland fd + IPC fd, no GLib main context. */
+static int gui_pump(App *a, int timeout_ms)
+{
+    if (wl_display_dispatch_pending(a->display) < 0)
+        return -1;
+    int want_write = 0;
+    if (wl_display_flush(a->display) < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            return -1;
+        want_write = 1;
     }
 
+    struct pollfd pfd[2];
+    pfd[0].fd = wl_display_get_fd(a->display);
+    pfd[0].events = POLLIN | (want_write ? POLLOUT : 0);
+    pfd[0].revents = 0;
+    pfd[1].fd = g_ipc;
+    pfd[1].events = POLLIN;
+    pfd[1].revents = 0;
+
+    int pr = poll(pfd, 2, timeout_ms);
+    if (pr < 0)
+        return (errno == EINTR) ? 0 : -1;
+    if (pr == 0)
+        return 0;
+
+    if (pfd[0].revents & POLLOUT) {
+        if (wl_display_flush(a->display) < 0 && errno != EAGAIN)
+            return -1;
+    }
+    if (pfd[0].revents & (POLLERR | POLLHUP | POLLNVAL))
+        return -1;
+    if (pfd[0].revents & POLLIN) {
+        if (wl_display_dispatch(a->display) < 0)
+            return -1;
+    }
+    if (pfd[1].revents & (POLLIN | POLLHUP | POLLERR)) {
+        IpcMsg msg;
+        int r = ipc_recv(g_ipc, &msg);
+        if (r <= 0)
+            return -1;          /* daemon disappeared */
+        gui_handle_ipc(&msg, a);
+    }
+    return 0;
+}
+
+static int gui_main(void)
+{
     App a;
     memset(&a, 0, sizeof a);
-    memset(&g_auth, 0, sizeof g_auth);
+    /* g_auth is inherited from the daemon via fork() with the action,
+     * message, user and active state already set. */
     a.scale = 1;
-    a.ctl_fd = -1;
-    a.ctl_client_fd = -1;
     a.pointer_x = a.pointer_y = -1.0;
     g_app = &a;
 
@@ -2267,20 +2447,159 @@ int main(int argc, char **argv)
     }
 
     a.xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-    if (!a.xkb_ctx) {
-        fprintf(stderr, "jtpolkit: cannot create xkb context\n");
+    if (!a.xkb_ctx)
         return 1;
-    }
-
-    signal(SIGINT, on_signal);
-    signal(SIGTERM, on_signal);
-    signal(SIGPIPE, SIG_IGN);
 
     if (!wayland_start(&a)) {
         app_cleanup(&a);
         return 1;
     }
-    ctl_start(&a);
+
+    a.t0 = mono_sec();
+    double last = mono_sec();
+
+    while (!a.quit && !g_signal_quit) {
+        double now = mono_sec();
+        double dt = now - last;
+        if (dt > 0.12) dt = 0.12;
+        if (dt < 0.0) dt = 0.0;
+        last = now;
+
+        if (g_auth.complete && g_auth.hide_at > 0.0 &&
+            now >= g_auth.hide_at) {
+            app_hide_window();
+            if (g_ipc_done)
+                break;
+            memset(&g_auth, 0, sizeof g_auth);
+        }
+
+        double interval = a.visible ? 1.0 / 20.0 : 1.0;
+        int due = a.dirty || (a.visible && now - a.last_draw >= interval);
+        if (a.configured && due && !a.frame_cb && a.visible) {
+            app_draw(&a, now - a.t0);
+            a.dirty = 0;
+            a.last_draw = now;
+        }
+
+        int timeout;
+        if (!a.configured || a.frame_cb)
+            timeout = 100;
+        else if (a.visible) {
+            double wait = interval - (mono_sec() - a.last_draw);
+            if (wait < 0.0) wait = 0.0;
+            timeout = (int)(wait * 1000.0) + 1;
+        } else {
+            timeout = 100;
+        }
+
+        if (gui_pump(&a, timeout) < 0)
+            break;
+    }
+
+    app_cleanup(&a);
+    if (g_ipc >= 0) {
+        close(g_ipc);
+        g_ipc = -1;
+    }
+    g_app = NULL;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Daemon process: polkit registration, no Wayland                    */
+/* ------------------------------------------------------------------ */
+
+static int daemon_poll(int timeout_ms)
+{
+    struct pollfd pfd[3];
+    int nfds = 0;
+    int ctl_idx = -1, client_idx = -1, ipc_idx = -1;
+
+    if (g_ctl.fd >= 0) {
+        ctl_idx = nfds;
+        pfd[nfds].fd = g_ctl.fd;
+        pfd[nfds].events = POLLIN;
+        pfd[nfds].revents = 0;
+        nfds++;
+    }
+    if (g_ctl.client_fd >= 0) {
+        client_idx = nfds;
+        pfd[nfds].fd = g_ctl.client_fd;
+        pfd[nfds].events = POLLIN;
+        pfd[nfds].revents = 0;
+        nfds++;
+    }
+    if (g_ipc >= 0) {
+        ipc_idx = nfds;
+        pfd[nfds].fd = g_ipc;
+        pfd[nfds].events = POLLIN;
+        pfd[nfds].revents = 0;
+        nfds++;
+    }
+    if (nfds == 0) {
+        poll(NULL, 0, timeout_ms);
+        return 0;
+    }
+
+    int pr = poll(pfd, (nfds_t)nfds, timeout_ms);
+    if (pr < 0)
+        return (errno == EINTR) ? 0 : -1;
+    if (pr == 0)
+        return 0;
+
+    if (ctl_idx >= 0 && (pfd[ctl_idx].revents & POLLIN))
+        ctl_accept();
+    if (client_idx >= 0 && pfd[client_idx].revents)
+        ctl_read_client();
+    if (ipc_idx >= 0 && (pfd[ipc_idx].revents & (POLLIN | POLLHUP | POLLERR))) {
+        IpcMsg msg;
+        int r = ipc_recv(g_ipc, &msg);
+        if (r <= 0) {
+            /* GUI exited (e.g. window closed).  Cancel the request.
+             * Leave g_gui_pid set so the main loop can reap it. */
+            close(g_ipc);
+            g_ipc = -1;
+            if (!g_ctl.quit && g_auth.active && !g_auth.complete)
+                auth_cancel();
+        } else if (msg.type == IPC_CLOSE) {
+            if (!g_ctl.quit && g_auth.active && !g_auth.complete)
+                auth_cancel();
+        } else if (msg.type == IPC_PASSWORD) {
+            if (g_auth.active && !g_auth.complete && g_auth.awaiting) {
+                g_auth.awaiting = 0;
+                char *password = g_strdup(msg.payload);
+                polkit_agent_session_response(g_auth.session,
+                                              password ? password : "");
+                if (password) {
+                    memset(password, 0, strlen(password));
+                    g_free(password);
+                }
+                memset(g_auth.password, 0, sizeof g_auth.password);
+            }
+        } else if (msg.type == IPC_CANCEL) {
+            if (g_auth.active && !g_auth.complete)
+                auth_cancel();
+        }
+    }
+    return 0;
+}
+
+static void on_signal(int sig)
+{
+    (void)sig;
+    g_signal_quit = 1;
+}
+
+static int daemon_main(void)
+{
+    memset(&g_auth, 0, sizeof g_auth);
+
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+    signal(SIGPIPE, SIG_IGN);
+
+    if (!ctl_start())
+        return 1;
 
     /* Register for this process' login session; fall back to the process
      * subject on systems without a logind session. */
@@ -2304,53 +2623,23 @@ int main(int argc, char **argv)
                 error ? error->message : "unknown error");
         g_clear_error(&error);
         g_object_unref(listener);
-        ctl_cleanup(&a);
-        app_cleanup(&a);
+        ctl_cleanup();
         return 1;
     }
 
-    a.t0 = mono_sec();
-    double last = mono_sec();
+    while (!g_ctl.quit && !g_signal_quit) {
+        /* Reap exited GUI children so they don't linger as zombies. */
+        if (g_gui_pid > 0) {
+            int status;
+            pid_t r = waitpid(g_gui_pid, &status, WNOHANG);
+            if (r == g_gui_pid)
+                g_gui_pid = -1;
+        }
 
-    while (!a.quit && !g_signal_quit) {
-        /* Polkit and the session helper deliver their callbacks through
-         * the default GLib main context. */
+        /* Polkit callbacks are delivered through the default GLib context. */
         if (g_main_context_pending(NULL))
             g_main_context_iteration(NULL, FALSE);
-
-        double now = mono_sec();
-        double dt = now - last;
-        if (dt > 0.12) dt = 0.12;
-        if (dt < 0.0) dt = 0.0;
-        last = now;
-
-        if (g_auth.complete && g_auth.hide_at > 0.0 &&
-            now >= g_auth.hide_at) {
-            app_hide_window();
-            memset(&g_auth, 0, sizeof g_auth);
-        }
-
-        double interval = a.visible ? 1.0 / 20.0 : 1.0;
-        int due = a.dirty || (a.visible && now - a.last_draw >= interval);
-        if (a.configured && due && !a.frame_cb && a.visible) {
-            app_draw(&a, now - a.t0);
-            a.dirty = 0;
-            a.last_draw = now;
-        }
-
-        int timeout;
-        if (!a.configured || a.frame_cb)
-            timeout = 100;
-        else if (a.visible) {
-            double wait = interval - (mono_sec() - a.last_draw);
-            if (wait < 0.0)
-                wait = 0.0;
-            timeout = (int)(wait * 1000.0) + 1;
-        } else {
-            timeout = 100;
-        }
-
-        if (pump_events(&a, timeout) < 0)
+        if (daemon_poll(100) < 0)
             break;
     }
 
@@ -2366,10 +2655,38 @@ int main(int argc, char **argv)
     }
     memset(g_auth.password, 0, sizeof g_auth.password);
 
+    gui_stop();
     polkit_agent_listener_unregister(registration);
     g_object_unref(listener);
-
-    app_cleanup(&a);
-    g_app = NULL;
+    ctl_cleanup();
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  main                                                               */
+/* ------------------------------------------------------------------ */
+
+int main(int argc, char **argv)
+{
+    if (!accent_cli(&argc, argv))
+        return 2;
+
+    if (argc >= 2 && (!strcmp(argv[1], "-h") ||
+                      !strcmp(argv[1], "--help"))) {
+        printf("usage: %s [ACCENT]\n\n"
+               "  ACCENT              #RRGGBB or RRGGBB, for example '#378484'\n"
+               "  --accent COLOR      explicit form of ACCENT\n\n"
+               "the default accent is #E8A03C (amber)\n\n"
+               "runs a resident polkit authentication daemon.  A GUI window\n"
+               "appears only while a request is outstanding; closing it cancels\n"
+               "that request but leaves the daemon running.\n\n"
+               "live accent: jtpolkitctl accent '#RRGGBB'\n"
+               "quit daemon: jtpolkitctl quit\n"
+               "requires a Wayland compositor supporting xdg-shell\n",
+               argv[0]);
+        return 0;
+    }
+
+    /* The GUI child is forked from the daemon; it never re-enters here. */
+    return daemon_main();
 }
