@@ -58,7 +58,7 @@
 /* ------------------------------------------------------------------ */
 
 #define DESIGN_W 470.0
-#define DESIGN_H 360.0
+#define DESIGN_H 332.0
 
 #define FONT_FAMILY "Liberation"
 
@@ -614,12 +614,12 @@ static void paint_header(cairo_t *cr)
 
 static void paint_input(cairo_t *cr, double t)
 {
-    double y = 180.0;
+    double y = 152.0;
     double h = 48.0;
 
     text_draw(cr, g_auth.prompt[0] ? g_auth.prompt : "Password: ",
               10.5, 600, C_DIM, 0.92,
-              25.0, 152.0, ALIGN_LEFT, 0.4);
+              25.0, 124.0, ALIGN_LEFT, 0.4);
 
     rounded_rect(cr, 24.0, y, DESIGN_W - 48.0, h, 10.0);
     rgba(cr, C_CARD, 0.96);
@@ -664,7 +664,7 @@ static void paint_input(cairo_t *cr, double t)
 
 #define BTN_CANCEL_X 154.0
 #define BTN_OK_X     278.0
-#define BTN_Y        282.0
+#define BTN_Y        254.0
 #define BTN_CANCEL_W 112.0
 #define BTN_OK_W     168.0
 #define BTN_H        42.0
@@ -747,7 +747,7 @@ static void paint_status(cairo_t *cr)
     }
 
     text_draw(cr, text, 10.0, 400, color, alpha,
-              25.0, 246.0, ALIGN_LEFT, 0.15);
+              25.0, 218.0, ALIGN_LEFT, 0.15);
 }
 
 /* Pointer state used by the button paints. */
@@ -1541,7 +1541,7 @@ static void update_cursor(App *a)
     if (!busy && (hit_cancel(a->pointer_x, a->pointer_y) ||
                   hit_ok(a->pointer_x, a->pointer_y)))
         shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER;
-    else if (!busy && a->pointer_y >= 180.0 && a->pointer_y <= 228.0 &&
+    else if (!busy && a->pointer_y >= 152.0 && a->pointer_y <= 200.0 &&
              a->pointer_x >= 24.0 && a->pointer_x <= DESIGN_W - 24.0)
         shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT;
     else if (a->pointer_y < 57.0)
