@@ -37,6 +37,7 @@
 
 #include <glib.h>
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -48,6 +49,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/un.h>
 #include <time.h>
@@ -292,6 +294,12 @@ static PangoFontDescription *font_get(double size, int weight)
         g_fonts[g_font_count].key = key;
         g_fonts[g_font_count].fd = fd;
         g_font_count++;
+    } else {
+        /* The cache owns every FontEnt.  Evict one rather than returning an
+         * unowned description that no caller frees. */
+        pango_font_description_free(g_fonts[0].fd);
+        g_fonts[0].key = key;
+        g_fonts[0].fd = fd;
     }
     return fd;
 }
@@ -383,6 +391,7 @@ typedef struct {
     int echo_on;        /* echo the response (otherwise show dots) */
     int complete;       /* authentication finished, window lingering */
     int ok;             /* finished successfully */
+    int initiated;      /* polkit session was started */
 
     double hide_at;     /* when the lingering window is unmapped */
 
@@ -432,7 +441,14 @@ static int ipc_send(int fd, int type, const char *payload)
     msg.type = type;
     if (payload)
         snprintf(msg.payload, sizeof msg.payload, "%s", payload);
-    return (int)write(fd, &msg, sizeof msg) == (int)sizeof msg;
+
+    /* The socketpair is blocking and SOCK_SEQPACKET: retry only EINTR and
+     * require one complete record rather than splitting it across writes. */
+    ssize_t n;
+    do {
+        n = write(fd, &msg, sizeof msg);
+    } while (n < 0 && errno == EINTR);
+    return n == (ssize_t)sizeof msg;
 }
 
 /* Returns 1 on a message, 0 on EOF, -1 on error (errno set). */
@@ -952,7 +968,13 @@ static void on_cancelled(GCancellable *cancellable, gpointer user_data)
 {
     (void)cancellable;
     (void)user_data;
-    auth_cancel();
+    /* g_cancellable_connect() invokes this synchronously when already
+     * cancelled.  With no initiated session there is nothing to hand to
+     * polkit, so finish the task here instead. */
+    if (!g_auth.initiated)
+        auth_complete(FALSE, "Authentication cancelled");
+    else
+        auth_cancel();
 }
 
 typedef struct _JtListener JtListener;
@@ -984,6 +1006,10 @@ static void jt_initiate_authentication(PolkitAgentListener *listener,
 
     if (g_auth.active)
         auth_complete(FALSE, "Another authentication request is in progress");
+
+    /* Do not let a lingering GUI from the previous request display this
+     * one's password prompt under the previous action and user text. */
+    gui_stop();
 
     memset(&g_auth, 0, sizeof g_auth);
     g_auth.active = 1;
@@ -1017,12 +1043,9 @@ static void jt_initiate_authentication(PolkitAgentListener *listener,
     g_auth.task = g_task_new(listener, cancellable, callback, user_data);
     g_task_set_source_tag(g_auth.task,
                           (gpointer)jt_initiate_authentication);
-
-    if (cancellable) {
-        g_auth.cancellable = g_object_ref(cancellable);
-        g_auth.cancel_id = g_cancellable_connect(cancellable,
-            G_CALLBACK(on_cancelled), NULL, NULL);
-    }
+    /* on_cancelled() completes the task explicitly; do not also let GTask
+     * complete it from the cancellable and race with our own completion. */
+    g_task_set_check_cancellable(g_auth.task, FALSE);
 
     g_auth.session = polkit_agent_session_new(identity, cookie);
     if (owned_identity)
@@ -1036,7 +1059,18 @@ static void jt_initiate_authentication(PolkitAgentListener *listener,
     g_signal_connect(g_auth.session, "completed",
                      G_CALLBACK(session_completed), NULL);
 
+    if (cancellable) {
+        g_auth.cancellable = g_object_ref(cancellable);
+        g_auth.cancel_id = g_cancellable_connect(cancellable,
+            G_CALLBACK(on_cancelled), NULL, NULL);
+        /* Already cancelled (or cancelled from another thread): the handler
+         * finished and cleared g_auth, so do not start a live session. */
+        if (!g_auth.active)
+            return;
+    }
+
     app_show_window();
+    g_auth.initiated = 1;
     polkit_agent_session_initiate(g_auth.session);
 
     auth_mark_dirty();
@@ -1081,7 +1115,9 @@ typedef struct {
 
 typedef struct {
     struct wl_output *output;
+    uint32_t registry_name;
     int32_t scale;
+    int used;
     int entered;
     App *app;
 } Output;
@@ -1095,6 +1131,7 @@ struct App {
     struct zxdg_decoration_manager_v1 *deco_manager;
     struct xdg_toplevel_icon_manager_v1 *icon_manager;
     struct wl_seat *seat;
+    uint32_t seat_name;
     struct wl_pointer *pointer;
     uint32_t pointer_serial;
     struct wl_keyboard *keyboard;
@@ -1274,25 +1311,25 @@ static void request_frame(App *a)
     wl_callback_add_listener(a->frame_cb, &frame_listener, a);
 }
 
-static void app_draw(App *a, double t)
+static int app_draw(App *a, double t)
 {
     if (!a->configured || !a->surface || !a->shm || !a->visible)
-        return;
+        return 0;
 
     int w = (int)lround(DESIGN_W * a->scale);
     int h = (int)lround(DESIGN_H * a->scale);
     if (w < 1 || h < 1)
-        return;
+        return 0;
 
     ShmBuf *b = next_buffer(a, w, h);
     if (!b)
-        return;
+        return 0;
 
     cairo_surface_t *surf = cairo_image_surface_create_for_data(
         b->data, CAIRO_FORMAT_ARGB32, w, h, w * 4);
     if (cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) {
         cairo_surface_destroy(surf);
-        return;
+        return 0;
     }
 
     cairo_t *cr = cairo_create(surf);
@@ -1316,6 +1353,7 @@ static void app_draw(App *a, double t)
     request_frame(a);
     wl_surface_commit(a->surface);
     b->busy = 1;
+    return 1;
 }
 
 static void auth_mark_dirty(void)
@@ -1344,6 +1382,10 @@ static void app_hide_window(void)
     a->dirty = 0;
     g_hover_cancel = g_press_cancel = 0.0;
     g_hover_ok = g_press_ok = 0.0;
+    if (a->frame_cb) {
+        wl_callback_destroy(a->frame_cb);
+        a->frame_cb = NULL;
+    }
     wl_surface_attach(a->surface, NULL, 0, 0);
     wl_surface_damage(a->surface, 0, 0, (int)DESIGN_W, (int)DESIGN_H);
     wl_surface_commit(a->surface);
@@ -1356,6 +1398,8 @@ static void recalc_scale(App *a)
 
     int s = 0;
     for (int i = 0; i < a->output_count; i++) {
+        if (!a->outputs[i].used)
+            continue;
         if (a->outputs[i].entered && a->outputs[i].scale > s)
             s = a->outputs[i].scale;
     }
@@ -1365,6 +1409,7 @@ static void recalc_scale(App *a)
         return;
 
     a->scale = s;
+    a->dirty = 1;
     if (a->surface && wl_surface_get_version(a->surface) >= 3)
         wl_surface_set_buffer_scale(a->surface, s);
 
@@ -1499,6 +1544,8 @@ static void surface_enter(void *data, struct wl_surface *surface,
     (void)surface;
     App *a = data;
     for (int i = 0; i < a->output_count; i++) {
+        if (!a->outputs[i].used)
+            continue;
         if (a->outputs[i].output == output) {
             a->outputs[i].entered = 1;
             recalc_scale(a);
@@ -1513,6 +1560,8 @@ static void surface_leave(void *data, struct wl_surface *surface,
     (void)surface;
     App *a = data;
     for (int i = 0; i < a->output_count; i++) {
+        if (!a->outputs[i].used)
+            continue;
         if (a->outputs[i].output == output) {
             a->outputs[i].entered = 0;
             recalc_scale(a);
@@ -1834,6 +1883,12 @@ static void seat_capabilities(void *data, struct wl_seat *seat,
         a->pointer = wl_seat_get_pointer(seat);
         wl_pointer_add_listener(a->pointer, &pointer_listener, a);
     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && a->pointer) {
+        /* The cursor-shape device becomes inert with its wl_pointer. */
+        if (a->cursor_shape_device) {
+            wp_cursor_shape_device_v1_destroy(a->cursor_shape_device);
+            a->cursor_shape_device = NULL;
+            a->cursor_shape = 0;
+        }
         wl_pointer_destroy(a->pointer);
         a->pointer = NULL;
     }
@@ -1858,6 +1913,28 @@ static const struct wl_seat_listener seat_listener = {
     .capabilities = seat_capabilities,
     .name = seat_name,
 };
+
+static void seat_release(App *a)
+{
+    if (a->cursor_shape_device) {
+        wp_cursor_shape_device_v1_destroy(a->cursor_shape_device);
+        a->cursor_shape_device = NULL;
+        a->cursor_shape = 0;
+    }
+    if (a->pointer) {
+        wl_pointer_destroy(a->pointer);
+        a->pointer = NULL;
+    }
+    if (a->keyboard) {
+        wl_keyboard_destroy(a->keyboard);
+        a->keyboard = NULL;
+    }
+    if (a->seat) {
+        wl_seat_destroy(a->seat);
+        a->seat = NULL;
+    }
+    a->seat_name = 0;
+}
 
 static void registry_global(void *data, struct wl_registry *registry,
                             uint32_t name, const char *interface,
@@ -1889,20 +1966,42 @@ static void registry_global(void *data, struct wl_registry *registry,
         a->cursor_shape_manager = wl_registry_bind(
             registry, name, &wp_cursor_shape_manager_v1_interface, 1);
     } else if (!strcmp(interface, wl_seat_interface.name)) {
+        if (a->seat && a->seat_name == name)
+            return;
+        /* Keep only one active seat; the UI has a single pointer/keyboard. */
+        if (a->seat)
+            seat_release(a);
         a->seat = wl_registry_bind(registry, name, &wl_seat_interface,
                                    version < 5 ? version : 5);
-        wl_seat_add_listener(a->seat, &seat_listener, a);
+        if (a->seat) {
+            a->seat_name = name;
+            wl_seat_add_listener(a->seat, &seat_listener, a);
+        }
     } else if (!strcmp(interface, wl_output_interface.name)) {
-        if (a->output_count < MAX_OUTPUTS) {
-            Output *o = &a->outputs[a->output_count];
-            o->output = wl_registry_bind(registry, name,
-                                         &wl_output_interface,
-                                         version < 2 ? version : 2);
-            o->scale = 1;
-            o->entered = 0;
-            o->app = a;
-            wl_output_add_listener(o->output, &output_listener, o);
-            a->output_count++;
+        /* Keep slots stable: live wl_output listeners point at &outputs[i]. */
+        int slot = -1;
+        for (int i = 0; i < MAX_OUTPUTS; i++) {
+            if (!a->outputs[i].used) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot >= 0) {
+            struct wl_output *out = wl_registry_bind(registry, name,
+                                                     &wl_output_interface,
+                                                     version < 2 ? version : 2);
+            if (out) {
+                Output *o = &a->outputs[slot];
+                o->output = out;
+                o->registry_name = name;
+                o->scale = 1;
+                o->used = 1;
+                o->entered = 0;
+                o->app = a;
+                wl_output_add_listener(out, &output_listener, o);
+                if (slot + 1 > a->output_count)
+                    a->output_count = slot + 1;
+            }
         }
     }
 }
@@ -1910,9 +2009,25 @@ static void registry_global(void *data, struct wl_registry *registry,
 static void registry_global_remove(void *data, struct wl_registry *registry,
                                    uint32_t name)
 {
-    (void)data;
     (void)registry;
-    (void)name;
+    App *a = data;
+
+    if (a->seat && a->seat_name == name) {
+        seat_release(a);
+        return;
+    }
+
+    for (int i = 0; i < a->output_count; i++) {
+        Output *o = &a->outputs[i];
+        if (!o->used || o->registry_name != name)
+            continue;
+        if (o->output)
+            wl_output_destroy(o->output);
+        memset(o, 0, sizeof *o);
+        recalc_scale(a);
+        a->dirty = 1;
+        return;
+    }
 }
 
 static const struct wl_registry_listener registry_listener = {
@@ -2005,8 +2120,12 @@ static int wayland_start(App *a)
 typedef struct {
     int fd;
     int client_fd;
+    /* Filesystem identity of our bound path; fstat(fd) returns sockfs. */
+    dev_t ctl_dev;
+    ino_t ctl_ino;
     char buf[256];
     size_t len;
+    double last_active;   /* time of most recent client input */
     int quit;
 } Ctl;
 
@@ -2017,6 +2136,43 @@ static void ctl_path(char *buf, size_t n)
     const char *rt = getenv("XDG_RUNTIME_DIR");
     if (!rt || !rt[0]) rt = "/tmp";
     snprintf(buf, n, "%s/jtpolkit-ctl.sock", rt);
+}
+
+/* A non-blocking connect distinguishes a live server from a stale path. */
+static int ctl_path_live(const char *path)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0)
+        return 0;
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    snprintf(addr.sun_path, sizeof addr.sun_path, "%s", path);
+    int rc = connect(fd, (struct sockaddr *)&addr, sizeof addr);
+    int err = errno;
+    close(fd);
+    if (rc == 0 || err == EINPROGRESS || err == EAGAIN)
+        return 1;
+    return err != ENOENT && err != ECONNREFUSED && err != ECONNABORTED;
+}
+
+static void ctl_ack_client(void)
+{
+    if (g_ctl.client_fd < 0)
+        return;
+    char ack = 'A';
+    ssize_t n;
+    do {
+        n = write(g_ctl.client_fd, &ack, 1);
+    } while (n < 0 && errno == EINTR);
+}
+
+static void ctl_unlink_owned(const char *path, dev_t dev, ino_t ino)
+{
+    if (!path || !*path || (dev == 0 && ino == 0))
+        return;
+    struct stat st;
+    if (lstat(path, &st) == 0 && S_ISSOCK(st.st_mode) &&
+        st.st_dev == dev && st.st_ino == ino)
+        unlink(path);
 }
 
 static void ctl_handle_line(char *line)
@@ -2033,6 +2189,7 @@ static void ctl_handle_line(char *line)
         g_ctl.quit = 1;
         auth_cancel();
         ipc_send(g_ipc, IPC_QUIT, "");
+        ctl_ack_client();
         return;
     }
 
@@ -2049,6 +2206,7 @@ static void ctl_handle_line(char *line)
             ipc_send(g_ipc, IPC_ACCENT, hex);
         }
     }
+    ctl_ack_client();
 }
 
 static void ctl_close_client(void)
@@ -2087,6 +2245,7 @@ static void ctl_read_client(void)
     for (;;) {
         ssize_t n = read(g_ctl.client_fd, buf, sizeof(buf));
         if (n > 0) {
+            g_ctl.last_active = mono_sec();
             size_t room = sizeof(g_ctl.buf) - 1 - g_ctl.len;
             if ((size_t)n > room) {
                 ctl_close_client();
@@ -2123,12 +2282,25 @@ static void ctl_accept(void)
                 continue;
             break;
         }
+        /* The single-instance probe connects and immediately disconnects.
+         * Do not let that connection displace a real command. */
+        char probe;
+        ssize_t peek;
+        do {
+            peek = recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+        } while (peek < 0 && errno == EINTR);
+        if (peek == 0 || (peek < 0 && errno != EAGAIN &&
+                          errno != EWOULDBLOCK)) {
+            close(fd);
+            continue;
+        }
         if (g_ctl.client_fd >= 0) {
             close(fd);
             continue;
         }
         g_ctl.client_fd = fd;
         g_ctl.len = 0;
+        g_ctl.last_active = mono_sec();
     }
 }
 
@@ -2138,28 +2310,61 @@ static int ctl_start(void)
     ctl_path(path, sizeof(path));
 
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    if (strlen(path) >= sizeof(addr.sun_path)) {
+    if (!path[0] || strlen(path) >= sizeof(addr.sun_path)) {
         fprintf(stderr, "jtpolkit: control socket path too long: %s\n", path);
         return 0;
     }
     snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
 
+    struct stat st;
+    if (lstat(path, &st) == 0) {
+        if (!S_ISSOCK(st.st_mode)) {
+            fprintf(stderr, "jtpolkit: control path is not a socket: %s\n", path);
+            return 0;
+        }
+        /* Never unlink a socket that belongs to another user (the /tmp
+         * fallback is world-writable). */
+        if (st.st_uid != geteuid()) {
+            fprintf(stderr,
+                    "jtpolkit: control socket is owned by another user: %s\n",
+                    path);
+            return 0;
+        }
+    }
+    if (ctl_path_live(path)) {
+        fprintf(stderr, "jtpolkit: control socket already active: %s\n", path);
+        return 0;
+    }
     unlink(path);
+
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd < 0) {
         perror("jtpolkit: control socket");
         return 0;
     }
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    /* A Unix socket's mode is fixed at bind() time. */
+    mode_t old_umask = umask(0077);
+    int bound = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+    umask(old_umask);
+    if (bound < 0) {
         fprintf(stderr, "jtpolkit: cannot bind %s: %s\n", path, strerror(errno));
         close(fd);
         return 0;
     }
+    if (lstat(path, &st) != 0 || !S_ISSOCK(st.st_mode)) {
+        fprintf(stderr, "jtpolkit: cannot identify bound socket: %s\n", path);
+        close(fd);
+        unlink(path);
+        return 0;
+    }
+    g_ctl.ctl_dev = st.st_dev;
+    g_ctl.ctl_ino = st.st_ino;
+
     if (listen(fd, 4) < 0) {
         fprintf(stderr, "jtpolkit: cannot listen on %s: %s\n",
                 path, strerror(errno));
         close(fd);
-        unlink(path);
+        ctl_unlink_owned(path, g_ctl.ctl_dev, g_ctl.ctl_ino);
         return 0;
     }
 
@@ -2171,11 +2376,11 @@ static void ctl_cleanup(void)
 {
     ctl_close_client();
     if (g_ctl.fd >= 0) {
-        close(g_ctl.fd);
-        g_ctl.fd = -1;
         char path[256];
         ctl_path(path, sizeof(path));
-        unlink(path);
+        ctl_unlink_owned(path, g_ctl.ctl_dev, g_ctl.ctl_ino);
+        close(g_ctl.fd);
+        g_ctl.fd = -1;
     }
 }
 
@@ -2185,13 +2390,45 @@ static void ctl_cleanup(void)
 
 static int g_ipc_done;   /* GUI: daemon sent IPC_DONE, exit after linger */
 
+/* The daemon owns the polkit registration and a GDBus connection.  A forked
+ * GUI child must not keep those descriptors alive: if the daemon is killed
+ * while a prompt is open, a stale bus connection would keep the agent
+ * registered and block a replacement.  Keep only stdio and the IPC socket. */
+static void close_inherited_fds(int keep)
+{
+    DIR *dir = opendir("/proc/self/fd");
+    if (dir) {
+        int dfd = dirfd(dir);
+        struct dirent *ent;
+        while ((ent = readdir(dir)) != NULL) {
+            int fd = atoi(ent->d_name);
+            if (fd > 2 && fd != keep && fd != dfd)
+                close(fd);
+        }
+        closedir(dir);
+        return;
+    }
+    long max = sysconf(_SC_OPEN_MAX);
+    if (max < 0 || max > 4096)
+        max = 4096;
+    for (int fd = 3; fd < max; fd++)
+        if (fd != keep)
+            close(fd);
+}
+
 static void gui_spawn(void)
 {
     if (g_gui_pid > 0) {
         int status;
         pid_t r = waitpid(g_gui_pid, &status, WNOHANG);
-        if (r == 0)
-            return;                 /* still running */
+        if (r == 0 && g_ipc >= 0)
+            return;                 /* live child with a live IPC link */
+        if (r == 0) {
+            /* Child has dropped its IPC end but has not exited yet; it is
+             * shutting down.  Do not hand a new prompt to a dying process. */
+            kill(g_gui_pid, SIGTERM);
+            waitpid(g_gui_pid, NULL, 0);
+        }
         g_gui_pid = -1;
     }
     if (g_ipc >= 0) {
@@ -2213,6 +2450,17 @@ static void gui_spawn(void)
         /* Child: run the Wayland GUI.  g_auth is inherited with the
          * request details already filled in. */
         close(sv[0]);
+        /* Do not keep the daemon's control endpoints alive in the child:
+         * a killed daemon must leave no reachable but unserviced socket. */
+        if (g_ctl.fd >= 0) {
+            close(g_ctl.fd);
+            g_ctl.fd = -1;
+        }
+        if (g_ctl.client_fd >= 0) {
+            close(g_ctl.client_fd);
+            g_ctl.client_fd = -1;
+        }
+        close_inherited_fds(sv[1]);
         g_ipc = sv[1];
         g_is_gui = 1;
         int rc = gui_main();
@@ -2447,23 +2695,21 @@ static int gui_main(void)
     }
 
     a.xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-    if (!a.xkb_ctx)
+    if (!a.xkb_ctx) {
+        g_app = NULL;
         return 1;
+    }
 
     if (!wayland_start(&a)) {
         app_cleanup(&a);
+        g_app = NULL;
         return 1;
     }
 
     a.t0 = mono_sec();
-    double last = mono_sec();
 
     while (!a.quit && !g_signal_quit) {
         double now = mono_sec();
-        double dt = now - last;
-        if (dt > 0.12) dt = 0.12;
-        if (dt < 0.0) dt = 0.0;
-        last = now;
 
         if (g_auth.complete && g_auth.hide_at > 0.0 &&
             now >= g_auth.hide_at) {
@@ -2476,8 +2722,8 @@ static int gui_main(void)
         double interval = a.visible ? 1.0 / 20.0 : 1.0;
         int due = a.dirty || (a.visible && now - a.last_draw >= interval);
         if (a.configured && due && !a.frame_cb && a.visible) {
-            app_draw(&a, now - a.t0);
-            a.dirty = 0;
+            if (app_draw(&a, now - a.t0))
+                a.dirty = 0;
             a.last_draw = now;
         }
 
@@ -2565,7 +2811,8 @@ static int daemon_poll(int timeout_ms)
             if (!g_ctl.quit && g_auth.active && !g_auth.complete)
                 auth_cancel();
         } else if (msg.type == IPC_PASSWORD) {
-            if (g_auth.active && !g_auth.complete && g_auth.awaiting) {
+            if (g_auth.active && !g_auth.complete && g_auth.awaiting &&
+                g_auth.session) {
                 g_auth.awaiting = 0;
                 char *password = g_strdup(msg.payload);
                 polkit_agent_session_response(g_auth.session,
@@ -2635,6 +2882,13 @@ static int daemon_main(void)
             if (r == g_gui_pid)
                 g_gui_pid = -1;
         }
+
+        /* A stalled single-slot client must not block later commands
+         * (notably "quit").  jtpolkitctl waits at most two seconds for its
+         * acknowledgement, so five seconds of silence is unambiguous. */
+        if (g_ctl.client_fd >= 0 &&
+            mono_sec() - g_ctl.last_active > 5.0)
+            ctl_close_client();
 
         /* Polkit callbacks are delivered through the default GLib context. */
         if (g_main_context_pending(NULL))

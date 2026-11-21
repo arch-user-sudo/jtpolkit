@@ -5,6 +5,8 @@
  *   jtpolkitctl '#RRGGBB'          shorthand for the same
  *   jtpolkitctl quit               unregister and exit the agent
  */
+#include <errno.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,12 +14,13 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
-static void
+static int
 ctl_path(char *buf, size_t n)
 {
     const char *rt = getenv("XDG_RUNTIME_DIR");
     if (!rt || !rt[0]) rt = "/tmp";
-    snprintf(buf, n, "%s/jtpolkit-ctl.sock", rt);
+    int len = snprintf(buf, n, "%s/jtpolkit-ctl.sock", rt);
+    return len >= 0 && (size_t)len < n;
 }
 
 static int
@@ -106,7 +109,14 @@ main(int argc, char *argv[])
     }
 
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    ctl_path(addr.sun_path, sizeof(addr.sun_path));
+    char path[256];
+    if (!ctl_path(path, sizeof path) ||
+        strlen(path) >= sizeof addr.sun_path) {
+        fprintf(stderr, "jtpolkitctl: control socket path too long\n");
+        close(fd);
+        return 1;
+    }
+    memcpy(addr.sun_path, path, strlen(path) + 1);
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         fprintf(stderr,
                 "jtpolkitctl: cannot connect to %s (is jtpolkit running?)\n",
@@ -116,7 +126,31 @@ main(int argc, char *argv[])
     }
 
     size_t len = strlen(msg);
-    ssize_t n = send(fd, msg, len, MSG_NOSIGNAL);
+    ssize_t sent;
+    do {
+        sent = send(fd, msg, len, MSG_NOSIGNAL);
+    } while (sent < 0 && errno == EINTR);
+    if (sent < 0 || (size_t)sent != len) {
+        close(fd);
+        return 1;
+    }
+
+    /* The daemon acknowledges processed commands.  Without this, a second
+     * client being dropped by the single-slot server still looks successful. */
+    struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+    int pr;
+    do {
+        pr = poll(&pfd, 1, 2000);
+    } while (pr < 0 && errno == EINTR);
+    if (pr <= 0) {
+        close(fd);
+        return 1;
+    }
+    char ack = 0;
+    ssize_t got;
+    do {
+        got = recv(fd, &ack, 1, 0);
+    } while (got < 0 && errno == EINTR);
     close(fd);
-    return (n >= 0 && (size_t)n == len) ? 0 : 1;
+    return (got == 1 && ack == 'A') ? 0 : 1;
 }
