@@ -295,10 +295,22 @@ static PangoFontDescription *font_get(double size, int weight)
     return fd;
 }
 
+/* Explicit Pango font options override anything derived from the target
+ * surface, so every glyph renders without antialiasing. */
+static void
+font_antialias_off(PangoLayout *layout)
+{
+    cairo_font_options_t *opts = cairo_font_options_create();
+    cairo_font_options_set_antialias(opts, CAIRO_ANTIALIAS_NONE);
+    pango_cairo_context_set_font_options(pango_layout_get_context(layout), opts);
+    cairo_font_options_destroy(opts);
+}
+
 static PangoLayout *layout_make(cairo_t *cr, const char *text,
                                 double size, int weight, double spacing)
 {
     PangoLayout *l = pango_cairo_create_layout(cr);
+    font_antialias_off(l);
     pango_layout_set_font_description(l, font_get(size, weight));
     pango_layout_set_text(l, text ? text : "", -1);
 
