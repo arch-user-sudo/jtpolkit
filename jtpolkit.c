@@ -1173,6 +1173,8 @@ struct App {
     int output_count;
 
     double t0;
+    double anim_t;        /* visual clock advanced by wl_surface.frame */
+    double anim_last;     /* monotonic time of the last frame step */
     double last_draw;
     double pointer_x, pointer_y;
 
@@ -1307,8 +1309,22 @@ static void frame_done(void *data, struct wl_callback *cb, uint32_t time)
 {
     (void)time;
     App *a = data;
+    if (a->frame_cb == cb) a->frame_cb = NULL;
     wl_callback_destroy(cb);
-    a->frame_cb = NULL;
+
+    /* Advance the visual clock on the compositor's presentation clock, with
+     * a clamped monotonic delta so a hidden/slow window never jumps. */
+    double now = mono_sec();
+    double dt = now - a->anim_last;
+    a->anim_last = now;
+    if (dt < 0.0) dt = 0.0;
+    if (dt > 0.12) dt = 0.12;
+    a->anim_t += dt;
+
+    /* While visible, keep the frame-callback chain alive so the ambient and
+     * caret motion is sampled once per presented frame. */
+    if (a->visible)
+        a->dirty = 1;
 }
 
 static const struct wl_callback_listener frame_listener = {
@@ -1381,6 +1397,9 @@ static void app_show_window(void)
         return;
     a->visible = 1;
     a->dirty = 1;
+    /* No frames run while hidden; restart the delta from now so the first
+     * presented frame does not advance the visual clock by the hidden gap. */
+    a->anim_last = mono_sec();
     g_hover_cancel = g_press_cancel = 0.0;
     g_hover_ok = g_press_ok = 0.0;
 }
@@ -2719,6 +2738,8 @@ static int gui_main(void)
     }
 
     a.t0 = mono_sec();
+    a.anim_t = 0.0;
+    a.anim_last = a.t0;
 
     while (!a.quit && !g_signal_quit) {
         double now = mono_sec();
@@ -2734,7 +2755,7 @@ static int gui_main(void)
         double interval = a.visible ? 1.0 / 20.0 : 1.0;
         int due = a.dirty || (a.visible && now - a.last_draw >= interval);
         if (a.configured && due && !a.frame_cb && a.visible) {
-            if (app_draw(&a, now - a.t0))
+            if (app_draw(&a, a.anim_t))
                 a.dirty = 0;
             a.last_draw = now;
         }
