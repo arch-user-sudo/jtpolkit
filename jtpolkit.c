@@ -389,6 +389,12 @@ static double text_wrap(cairo_t *cr, const char *text, double size, int weight,
 /*  Authentication state                                               */
 /* ------------------------------------------------------------------ */
 
+typedef enum {
+    AUTH_PHASE_IDLE = 0,
+    AUTH_PHASE_VERIFYING,
+    AUTH_PHASE_CANCELLING
+} AuthPhase;
+
 typedef struct {
     char action[256];
     char message[512];
@@ -404,6 +410,8 @@ typedef struct {
     int complete;       /* authentication finished, window lingering */
     int ok;             /* finished successfully */
     int initiated;      /* polkit session was started */
+    int cancelled;      /* daemon: cancel was requested */
+    AuthPhase phase;    /* GUI-only: immediate submit/cancel feedback */
 
     double hide_at;     /* when the lingering window is unmapped */
 
@@ -412,6 +420,12 @@ typedef struct {
     GCancellable *cancellable;
     gulong cancel_id;
 } Auth;
+
+/* Long enough to read the final status, short enough not to feel stuck. */
+#define HIDE_DELAY_OK   0.25
+#define HIDE_DELAY_FAIL 0.60
+
+#define DAEMON_POLL_MS 20
 
 typedef struct App App;
 
@@ -763,6 +777,14 @@ static void paint_status(cairo_t *cr)
         text = g_auth.info;
         color = C_ACCENT;
         alpha = 0.92;
+    } else if (g_auth.phase == AUTH_PHASE_CANCELLING) {
+        text = "Cancelling...";
+        color = C_ACCENT;
+        alpha = 0.92;
+    } else if (g_auth.phase == AUTH_PHASE_VERIFYING) {
+        text = "Verifying...";
+        color = C_ACCENT;
+        alpha = 0.92;
     } else if (g_auth.complete) {
         text = g_auth.ok ? "Authentication successful"
                          : "Authentication cancelled";
@@ -881,6 +903,8 @@ static void auth_submit(void)
         ipc_send(g_ipc, IPC_PASSWORD, g_auth.password);
         memset(g_auth.password, 0, sizeof g_auth.password);
         g_auth.info[0] = '\0';
+        g_auth.error[0] = '\0';
+        g_auth.phase = AUTH_PHASE_VERIFYING;
         auth_mark_dirty();
         return;
     }
@@ -902,8 +926,13 @@ static void auth_cancel(void)
         return;
     if (g_is_gui) {
         ipc_send(g_ipc, IPC_CANCEL, "");
+        g_auth.info[0] = '\0';
+        g_auth.error[0] = '\0';
+        g_auth.phase = AUTH_PHASE_CANCELLING;
+        auth_mark_dirty();
         return;
     }
+    g_auth.cancelled = 1;
     if (g_auth.session)
         polkit_agent_session_cancel(g_auth.session);
     else
@@ -919,12 +948,15 @@ static void auth_complete(gboolean ok, const char *message)
     g_auth.awaiting = 0;
     g_auth.complete = 1;
     g_auth.ok = !!ok;
-    g_auth.hide_at = mono_sec() + (ok ? 0.7 : 1.2);
+    g_auth.hide_at = mono_sec() + (ok ? HIDE_DELAY_OK : HIDE_DELAY_FAIL);
 
     if (ok)
         g_auth.error[0] = '\0';
     else if (message && *message)
         g_snprintf(g_auth.error, sizeof g_auth.error, "%s", message);
+    else if (g_auth.cancelled)
+        g_snprintf(g_auth.error, sizeof g_auth.error,
+                   "Authentication cancelled");
     else if (!g_auth.error[0])
         g_snprintf(g_auth.error, sizeof g_auth.error,
                    "Authentication failed");
@@ -2615,6 +2647,7 @@ static void gui_handle_ipc(IpcMsg *msg, App *a)
         g_auth.info[0] = '\0';
         g_auth.active = 1;
         g_auth.complete = 0;
+        g_auth.phase = AUTH_PHASE_IDLE;
         app_show_window();
         a->dirty = 1;
         break;
@@ -2636,7 +2669,8 @@ static void gui_handle_ipc(IpcMsg *msg, App *a)
         g_auth.awaiting = 0;
         g_auth.complete = 1;
         g_auth.ok = !!ok;
-        g_auth.hide_at = mono_sec() + (ok ? 0.7 : 1.2);
+        g_auth.phase = AUTH_PHASE_IDLE;
+        g_auth.hide_at = mono_sec() + (ok ? HIDE_DELAY_OK : HIDE_DELAY_FAIL);
         if (!ok && err && err[1])
             snprintf(g_auth.error, sizeof g_auth.error, "%s", err + 1);
         if (g_ipc_done == 0)
@@ -2762,13 +2796,14 @@ static int gui_main(void)
 
         int timeout;
         if (!a.configured || a.frame_cb)
-            timeout = 100;
+            timeout = 20;
         else if (a.visible) {
             double wait = interval - (mono_sec() - a.last_draw);
             if (wait < 0.0) wait = 0.0;
+            if (wait > 0.02) wait = 0.02;
             timeout = (int)(wait * 1000.0) + 1;
         } else {
-            timeout = 100;
+            timeout = 20;
         }
 
         if (gui_pump(&a, timeout) < 0)
@@ -2926,7 +2961,7 @@ static int daemon_main(void)
         /* Polkit callbacks are delivered through the default GLib context. */
         if (g_main_context_pending(NULL))
             g_main_context_iteration(NULL, FALSE);
-        if (daemon_poll(100) < 0)
+        if (daemon_poll(DAEMON_POLL_MS) < 0)
             break;
     }
 
