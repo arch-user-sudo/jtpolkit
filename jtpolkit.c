@@ -6,7 +6,9 @@
  *   make
  *   ./jtpolkit                       register as the session's agent
  *   ./jtpolkit '#378484'             optional accent override
+ *   ./jtpolkit rainbow               cycle the accent (or --rainbow)
  *   ./jtpolkitctl accent '#378484'   change the accent while running
+ *   ./jtpolkitctl rainbow [on|off|toggle]   cycle the accent
  *   ./jtpolkitctl quit               unregister and exit
  *
  * Enter submits a password, Escape cancels.  Windows are server-side
@@ -81,6 +83,12 @@ static unsigned accent_rgb = 0xE8A03C;
 static unsigned accent_hi_rgb = 0xF2B25C;
 static unsigned accent_lo_rgb = 0xCE8A2F;
 static unsigned on_accent_rgb = 0x14100A;
+/* Rainbow mode cycles the accent; the base colour is restored when it is
+ * switched off so an explicit accent is never lost.  The daemon owns this
+ * state and sends each tick to the GUI over IPC. */
+static unsigned accent_base_rgb = 0xE8A03C;
+static int rainbow_mode = 0;
+static double rainbow_start = 0.0;
 #define C_ACCENT    accent_rgb
 #define C_ACCENT_HI accent_hi_rgb
 #define C_ACCENT_LO accent_lo_rgb
@@ -205,12 +213,72 @@ static unsigned accent_mix(unsigned rgb, unsigned toward, double amount)
     return ((unsigned)r << 16) | ((unsigned)g << 8) | (unsigned)b;
 }
 
-static void accent_set(unsigned rgb)
+/* One full hue wheel every eight seconds, rendered as a saturated RGB
+ * triple.  t is seconds since rainbow mode was switched on. */
+static unsigned rainbow_color(double t)
+{
+    double phase = fmod(t, 8.0);
+    if (phase < 0.0)
+        phase += 8.0;
+    double h = phase * 0.75;
+    int i = (int)h;
+    double f = h - i;
+    double q = 1.0 - f;
+    double r = 0.0, g = 0.0, b = 0.0;
+    switch (i) {
+    case 0: r = 1.0; g = f;   b = 0.0; break;
+    case 1: r = q;   g = 1.0; b = 0.0; break;
+    case 2: r = 0.0; g = 1.0; b = f;   break;
+    case 3: r = 0.0; g = q;   b = 1.0; break;
+    case 4: r = f;   g = 0.0; b = 1.0; break;
+    default:r = 1.0; g = 0.0; b = q;   break;
+    }
+    return ((unsigned)lround(r * 255.0) << 16) |
+           ((unsigned)lround(g * 255.0) << 8) |
+           (unsigned)lround(b * 255.0);
+}
+
+static void accent_apply(unsigned rgb)
 {
     accent_rgb = rgb;
     accent_hi_rgb = accent_mix(rgb, 0xFFFFFF, 0.16);
     accent_lo_rgb = accent_mix(rgb, 0x000000, 0.14);
     on_accent_rgb = accent_ink(rgb);
+}
+
+/* An explicit colour takes over from rainbow mode and becomes the new base. */
+static void accent_set(unsigned rgb)
+{
+    accent_base_rgb = rgb;
+    rainbow_mode = 0;
+    accent_apply(rgb);
+}
+
+static void rainbow_set(int on, double t)
+{
+    int was_on = rainbow_mode;
+    rainbow_mode = on ? 1 : 0;
+    if (rainbow_mode) {
+        if (!was_on) {
+            rainbow_start = t;
+            accent_apply(rainbow_color(0.0));
+        }
+    } else if (was_on) {
+        accent_apply(accent_base_rgb);
+    }
+}
+
+/* Returns 1 only when the quantized hue changes, avoiding an IPC round trip
+ * and GUI repaint for identical colors. */
+static int accent_tick(double t)
+{
+    if (!rainbow_mode)
+        return 0;
+    unsigned rgb = rainbow_color(t - rainbow_start);
+    if (rgb == accent_rgb)
+        return 0;
+    accent_apply(rgb);
+    return 1;
 }
 
 /* Remove a leading '#RRGGBB', a bare RRGGBB, or an explicit --accent COLOR
@@ -220,6 +288,15 @@ static int accent_cli(int *argc, char **argv)
     for (int i = 1; i < *argc; i++) {
         const char *value = NULL;
         int consumed = 0;
+
+        if (!strcmp(argv[i], "--rainbow") || !strcmp(argv[i], "rainbow")) {
+            rainbow_set(1, mono_sec());
+            for (int j = i; j + 1 < *argc; j++)
+                argv[j] = argv[j + 1];
+            (*argc)--;
+            i--;
+            continue;
+        }
 
         if (!strcmp(argv[i], "--accent")) {
             if (i + 1 >= *argc) {
@@ -492,6 +569,18 @@ static int ipc_recv(int fd, IpcMsg *msg)
         return -1;
     }
     return 1;
+}
+
+/* Forward the daemon's current accent to the forked GUI.  No GUI child may
+ * exist yet (the window is spawned on demand), in which case it inherits the
+ * current accent directly from the daemon at fork time. */
+static void accent_publish(void)
+{
+    if (g_ipc < 0)
+        return;
+    char hex[16];
+    snprintf(hex, sizeof hex, "#%06X", accent_rgb);
+    ipc_send(g_ipc, IPC_ACCENT, hex);
 }
 
 static void gui_spawn(void);
@@ -2256,6 +2345,28 @@ static void ctl_handle_line(char *line)
         return;
     }
 
+    if (!strncmp(line, "rainbow", 7) &&
+        (line[7] == '\0' || line[7] == ' ' || line[7] == '\t')) {
+        const char *arg = line + 7;
+        while (*arg == ' ' || *arg == '\t')
+            arg++;
+        int on;
+        if (!*arg || !strcmp(arg, "toggle"))
+            on = !rainbow_mode;         /* bare command toggles */
+        else if (!strcmp(arg, "on"))
+            on = 1;                     /* force on, resetting the phase */
+        else if (!strcmp(arg, "off"))
+            on = 0;                     /* restore the base colour */
+        else
+            on = -1;
+        if (on >= 0) {
+            rainbow_set(on, mono_sec());
+            accent_publish();
+        }
+        ctl_ack_client();
+        return;
+    }
+
     if (strncmp(line, "accent", 6) == 0 &&
         (line[6] == ' ' || line[6] == '\t')) {
         const char *arg = line + 6;
@@ -2263,10 +2374,8 @@ static void ctl_handle_line(char *line)
             arg++;
         unsigned rgb;
         if (accent_parse(arg, &rgb)) {
-            accent_set(rgb);
-            char hex[16];
-            snprintf(hex, sizeof hex, "#%06X", rgb);
-            ipc_send(g_ipc, IPC_ACCENT, hex);
+            accent_set(rgb);            /* also ends rainbow mode */
+            accent_publish();
         }
     }
     ctl_ack_client();
@@ -2681,7 +2790,9 @@ static void gui_handle_ipc(IpcMsg *msg, App *a)
     case IPC_ACCENT: {
         unsigned rgb;
         if (accent_parse(msg->payload, &rgb)) {
-            accent_set(rgb);
+            /* The daemon owns the base/mode/start; the GUI only adopts the
+             * colour it is sent and repaints on the existing frame loop. */
+            accent_apply(rgb);
             a->dirty = 1;
         }
         break;
@@ -2905,6 +3016,22 @@ static void on_signal(int sig)
     g_signal_quit = 1;
 }
 
+/* The daemon's poll loop already iterates the default GLib context for
+ * polkit callbacks, so a timeout source is delivered without a second event
+ * loop.  Each tick advances the hue and republishes the accent to the GUI;
+ * the GUI repaints on its existing Wayland frame-callback loop. */
+#define RAINBOW_TICK_MS 100
+
+static gboolean rainbow_daemon_tick(gpointer user_data)
+{
+    (void)user_data;
+    if (!rainbow_mode)
+        return G_SOURCE_CONTINUE;
+    if (accent_tick(mono_sec()))
+        accent_publish();
+    return G_SOURCE_CONTINUE;
+}
+
 static int daemon_main(void)
 {
     memset(&g_auth, 0, sizeof g_auth);
@@ -2942,6 +3069,9 @@ static int daemon_main(void)
         return 1;
     }
 
+    guint rainbow_source = g_timeout_add(RAINBOW_TICK_MS,
+                                         rainbow_daemon_tick, NULL);
+
     while (!g_ctl.quit && !g_signal_quit) {
         /* Reap exited GUI children so they don't linger as zombies. */
         if (g_gui_pid > 0) {
@@ -2964,6 +3094,9 @@ static int daemon_main(void)
         if (daemon_poll(DAEMON_POLL_MS) < 0)
             break;
     }
+
+    if (rainbow_source)
+        g_source_remove(rainbow_source);
 
     if (g_auth.active)
         auth_complete(FALSE, "Authentication agent exited");
@@ -2995,14 +3128,16 @@ int main(int argc, char **argv)
 
     if (argc >= 2 && (!strcmp(argv[1], "-h") ||
                       !strcmp(argv[1], "--help"))) {
-        printf("usage: %s [ACCENT]\n\n"
+        printf("usage: %s [ACCENT] [rainbow]\n\n"
                "  ACCENT              #RRGGBB or RRGGBB, for example '#378484'\n"
-               "  --accent COLOR      explicit form of ACCENT\n\n"
+               "  --accent COLOR      explicit form of ACCENT\n"
+               "  rainbow             cycle accent colours (or --rainbow)\n\n"
                "the default accent is #E8A03C (amber)\n\n"
                "runs a resident polkit authentication daemon.  A GUI window\n"
                "appears only while a request is outstanding; closing it cancels\n"
                "that request but leaves the daemon running.\n\n"
                "live accent: jtpolkitctl accent '#RRGGBB'\n"
+               "live rainbow: jtpolkitctl rainbow [on|off|toggle]\n"
                "quit daemon: jtpolkitctl quit\n"
                "requires a Wayland compositor supporting xdg-shell\n",
                argv[0]);
